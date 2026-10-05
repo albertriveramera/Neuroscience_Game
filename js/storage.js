@@ -1,10 +1,11 @@
 // js/storage.js
-// Storage management, schema migration, and state persistence for Neuroscience PhD Arena
+// Storage management, schema isolation, and state persistence for Neuroscience PhD Arena
 (function () {
   'use strict';
 
-  const STORAGE_KEY = 'neuro_phd_arcade_v1_save';
-  const LEGACY_V1_KEY = 'c2_arcade_v2_save';
+  // Dedicated, isolated storage key for Neuroscience PhD Arena
+  // Completely decoupled from the C2 English game to prevent any cross-game data collisions.
+  const STORAGE_KEY = 'neuroscience_phd_arena_save_v1';
 
   const DEFAULT_STATE = {
     version: 1,
@@ -44,7 +45,7 @@
 
   function isLocalStorageAvailable() {
     try {
-      const testKey = '__c2_storage_test__';
+      const testKey = '__neuro_phd_storage_test__';
       window.localStorage.setItem(testKey, 'ok');
       window.localStorage.removeItem(testKey);
       return true;
@@ -55,55 +56,24 @@
 
   const hasStorage = isLocalStorageAvailable();
 
-  function migrateV1ToV2(v1Data) {
-    const v2 = JSON.parse(JSON.stringify(DEFAULT_STATE));
-
-    // Transfer profile stats (omitting legacy XP)
-    if (v1Data.profile) {
-      v2.profile.streakDays = v1Data.profile.streakDays || 0;
-      v2.profile.lastPlayedDate = v1Data.profile.lastPlayedDate || null;
-      v2.profile.sessionsCompleted = v1Data.profile.sessionsCompleted || 0;
-      v2.profile.totalCorrect = v1Data.profile.totalCorrect || 0;
-      v2.profile.totalAnswered = v1Data.profile.totalAnswered || 0;
+  // Validate that a loaded or imported state belongs strictly to Neuroscience PhD Arena
+  function isNeuroscienceData(data) {
+    if (!data || typeof data !== 'object') return false;
+    if (data.ratings && typeof data.ratings === 'object') {
+      const hasNeuroRatings = data.ratings.neurobiology !== undefined ||
+                              data.ratings.neurogenetics !== undefined ||
+                              data.ratings.molecular !== undefined ||
+                              data.ratings.biochemistry !== undefined ||
+                              data.ratings.neurodegeneration !== undefined ||
+                              data.ratings.landmarks !== undefined;
+      // Reject if it contains legacy C2 English categories
+      const hasC2Ratings = data.ratings['use-of-english'] !== undefined ||
+                           data.ratings.reading !== undefined ||
+                           data.ratings.listening !== undefined ||
+                           data.ratings.gapped !== undefined;
+      return hasNeuroRatings && !hasC2Ratings;
     }
-
-    // Convert legacy adaptive levels to starting ELO ratings
-    const levelToElo = { 1: 1200, 2: 1350, 3: 1480, 4: 1600, 5: 1720 };
-    if (v1Data.adaptiveLevels) {
-      Object.keys(v2.ratings).forEach(m => {
-        const lvl = v1Data.adaptiveLevels[m] || 2;
-        v2.ratings[m] = levelToElo[lvl] || 1400;
-      });
-    }
-
-    // Convert legacy modeStats to answersByMode
-    if (v1Data.modeStats) {
-      Object.keys(v2.answersByMode).forEach(m => {
-        if (v1Data.modeStats[m]) {
-          v2.answersByMode[m].total = v1Data.modeStats[m].total || 0;
-          v2.answersByMode[m].correct = v1Data.modeStats[m].correct || 0;
-        }
-      });
-    }
-
-    // Transfer SRS items and mistakes queue
-    v2.items = v1Data.items || {};
-    v2.mistakesQueue = v1Data.mistakesQueue || [];
-    v2.soundEnabled = (v1Data.soundEnabled !== undefined) ? v1Data.soundEnabled : true;
-
-    // Calculate initial global rating
-    let sum = 0;
-    Object.values(v2.ratings).forEach(r => { sum += r; });
-    v2.globalRating = Math.round(sum / 6);
-
-    // Calculate rank index
-    if (window.C2ELO && window.C2ELO.getRank) {
-      const r = window.C2ELO.getRank(v2.globalRating, v2.profile.totalCorrect, 0);
-      v2.profile.rankIndex = r.index;
-    }
-
-    v2.version = 2;
-    return v2;
+    return false;
   }
 
   function loadState() {
@@ -115,36 +85,49 @@
     }
 
     try {
-      // Check for v2 save
+      // Clean up any old contaminated temporary key from earlier migration attempts
+      try {
+        window.localStorage.removeItem('neuro_phd_arcade_v1_save');
+      } catch (e) {}
+
       let raw = window.localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        // Shallow merge with defaults
+
+        // Sanity check: verify that this save is genuine neuroscience data
+        if (!isNeuroscienceData(parsed)) {
+          console.warn('Contaminated or unrecognized save detected in storage. Resetting to clean Neuroscience state.');
+          const fresh = JSON.parse(JSON.stringify(DEFAULT_STATE));
+          saveState(fresh);
+          return fresh;
+        }
+
+        // Sanity check on items: filter out any legacy non-neuroscience question IDs
+        let cleanItems = {};
+        if (parsed.items && typeof parsed.items === 'object') {
+          for (let [id, val] of Object.entries(parsed.items)) {
+            if (id.startsWith('nb-') || id.startsWith('ng-') || id.startsWith('mc-') ||
+                id.startsWith('bc-') || id.startsWith('nd-') || id.startsWith('lm-')) {
+              cleanItems[id] = val;
+            }
+          }
+        }
+
+        // Merge cleanly with defaults
         const merged = Object.assign({}, DEFAULT_STATE, parsed, {
           profile: Object.assign({}, DEFAULT_STATE.profile, parsed.profile || {}),
           ratings: Object.assign({}, DEFAULT_STATE.ratings, parsed.ratings || {}),
           answersByMode: Object.assign({}, DEFAULT_STATE.answersByMode, parsed.answersByMode || {}),
-          recentModes: parsed.recentModes || [],
-          eloHistory: parsed.eloHistory || [],
-          items: parsed.items || {},
-          mistakesQueue: parsed.mistakesQueue || []
+          recentModes: Array.isArray(parsed.recentModes) ? parsed.recentModes : [],
+          eloHistory: Array.isArray(parsed.eloHistory) ? parsed.eloHistory : [],
+          items: cleanItems,
+          mistakesQueue: Array.isArray(parsed.mistakesQueue) ? parsed.mistakesQueue.filter(id =>
+            id.startsWith('nb-') || id.startsWith('ng-') || id.startsWith('mc-') ||
+            id.startsWith('bc-') || id.startsWith('nd-') || id.startsWith('lm-')
+          ) : []
         });
-        return merged;
-      }
 
-      // Check for legacy v1 save to migrate
-      const legacyRaw = window.localStorage.getItem(LEGACY_V1_KEY);
-      if (legacyRaw) {
-        try {
-          const v1Data = JSON.parse(legacyRaw);
-          const migrated = migrateV1ToV2(v1Data);
-          saveState(migrated);
-          // Clean up legacy key
-          try { window.localStorage.removeItem(LEGACY_V1_KEY); } catch (e) { }
-          return migrated;
-        } catch (e) {
-          console.warn('Migration failed, starting fresh v2 state:', e);
-        }
+        return merged;
       }
 
       // Fresh default state
@@ -175,7 +158,6 @@
     if (hasStorage) {
       try {
         window.localStorage.removeItem(STORAGE_KEY);
-        window.localStorage.removeItem(LEGACY_V1_KEY);
       } catch (e) { }
     }
     memoryFallback = null;
@@ -189,7 +171,7 @@
     const a = document.createElement('a');
     const dateStr = new Date().toISOString().split('T')[0];
     a.href = url;
-    a.download = `c2_english_arcade_save_${dateStr}.json`;
+    a.download = `neuroscience_phd_arena_save_${dateStr}.json`;
     document.body.appendChild(a);
     a.click();
     setTimeout(() => {
@@ -202,19 +184,37 @@
     try {
       const parsed = JSON.parse(jsonString);
       if (!parsed || typeof parsed !== 'object') {
-        throw new Error('Invalid JSON format');
+        throw new Error('Invalid JSON format: save file must be an object.');
       }
 
-      let validState;
-      if (parsed.version === 2 && parsed.ratings && parsed.profile) {
-        validState = Object.assign({}, DEFAULT_STATE, parsed);
-      } else if (parsed.version === 1 || parsed.adaptiveLevels) {
-        validState = migrateV1ToV2(parsed);
-      } else if (parsed.ratings) {
-        validState = Object.assign({}, DEFAULT_STATE, parsed, { version: 2 });
-      } else {
-        throw new Error('Unrecognized save file schema');
+      // Guard: strictly ensure the file is a Neuroscience save
+      if (!isNeuroscienceData(parsed)) {
+        throw new Error('Incompatible save file: This save belongs to another game (e.g. C2 English) or is missing neuroscience disciplines.');
       }
+
+      // Filter items to neuroscience IDs only
+      let cleanItems = {};
+      if (parsed.items && typeof parsed.items === 'object') {
+        for (let [id, val] of Object.entries(parsed.items)) {
+          if (id.startsWith('nb-') || id.startsWith('ng-') || id.startsWith('mc-') ||
+              id.startsWith('bc-') || id.startsWith('nd-') || id.startsWith('lm-')) {
+            cleanItems[id] = val;
+          }
+        }
+      }
+
+      const validState = Object.assign({}, DEFAULT_STATE, parsed, {
+        profile: Object.assign({}, DEFAULT_STATE.profile, parsed.profile || {}),
+        ratings: Object.assign({}, DEFAULT_STATE.ratings, parsed.ratings || {}),
+        answersByMode: Object.assign({}, DEFAULT_STATE.answersByMode, parsed.answersByMode || {}),
+        recentModes: Array.isArray(parsed.recentModes) ? parsed.recentModes : [],
+        eloHistory: Array.isArray(parsed.eloHistory) ? parsed.eloHistory : [],
+        items: cleanItems,
+        mistakesQueue: Array.isArray(parsed.mistakesQueue) ? parsed.mistakesQueue.filter(id =>
+          id.startsWith('nb-') || id.startsWith('ng-') || id.startsWith('mc-') ||
+          id.startsWith('bc-') || id.startsWith('nd-') || id.startsWith('lm-')
+        ) : []
+      });
 
       saveState(validState);
       return { success: true, state: validState };
@@ -229,7 +229,8 @@
     resetProgress: resetProgress,
     exportState: exportState,
     validateAndImport: validateAndImport,
-    DEFAULT_STATE: DEFAULT_STATE
+    DEFAULT_STATE: DEFAULT_STATE,
+    STORAGE_KEY: STORAGE_KEY
   };
   window.NEURO_STORAGE = window.C2Storage;
 })();
